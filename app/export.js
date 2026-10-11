@@ -2,16 +2,20 @@
    ATELIER — export, Figma-style
    Boards are rendered by headless Chrome through the local server
    (atelier.py → /__atelier/render), so the output matches the
-   browser exactly. PNG and PDF come straight from Chrome; JPG and
-   WEBP are re-encoded here with the chosen quality. Several files
-   are bundled into a ZIP (stored, no compression, no dependencies).
+   browser exactly. The server keeps one Chrome running and renders
+   several boards at once, so jobs are sent in parallel. Files come
+   straight from Chrome when the size is exact; otherwise the PNG is
+   resampled here. Several PDFs can be merged into one (a page per
+   board). Several files are bundled into a ZIP (stored, no
+   compression, no dependencies).
 
    Each export setting is { scale, suffix, format, quality }:
      scale   → "2x" | "512w" (width in px) | "1080h" (height in px)
      suffix  → appended to the file name; empty = "@2x" style default
      format  → png | jpg | webp | pdf (pdf is vector, scale ignored)
      quality → 1–100, jpg/webp only
-   Settings are remembered in localStorage (atelier-export).
+   Settings are remembered in localStorage (atelier-export, and
+   atelier-export-merge for the single-PDF checkbox).
 
    API: ATELIER_EXPORT.open({ projectName, base, groups, checked })
         ATELIER_EXPORT.copyImage(base, def)
@@ -20,7 +24,8 @@
 (() => {
   const { t } = window.ATELIER_I18N;
   const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-  const KEY = 'atelier-export';
+  const KEY = 'atelier-export', MERGE_KEY = 'atelier-export-merge';
+  const PARALLEL = 4; // requests in flight; the server caps its own Chrome tabs
   const FORMATS = {
     png: { label: 'PNG', mime: 'image/png' },
     jpg: { label: 'JPG', mime: 'image/jpeg', quality: true },
@@ -36,11 +41,14 @@
     ? fetch('__atelier/ping').then(r => r.ok ? r.json().then(j => j.export ? 'ok' : 'nochrome') : 'noserver').catch(() => 'noserver')
     : Promise.resolve('noserver');
 
-  async function render(base, def, scale, format) {
-    const q = new URLSearchParams({
-      src: base + def.src, type: def.type === 'image' ? 'image' : 'html',
-      w: def.w, h: def.h, scale, format
-    });
+  // defs: one board, or several for a single multi-page PDF
+  async function render(base, defs, scale, format, quality) {
+    const q = new URLSearchParams({ scale, format });
+    if (quality) q.set('quality', quality);
+    for (const def of [].concat(defs)) {
+      q.append('src', base + def.src); q.append('type', def.type === 'image' ? 'image' : 'html');
+      q.append('w', def.w); q.append('h', def.h);
+    }
     const r = await fetch('__atelier/render?' + q);
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
     return r.blob();
@@ -76,6 +84,8 @@
     return [{ scale: '1x', suffix: '', format: 'png', quality: 90 }];
   };
   const save = v => { try { localStorage.setItem(KEY, JSON.stringify(v)); } catch {} };
+  const loadMerge = () => { try { return localStorage.getItem(MERGE_KEY) === '1'; } catch { return false; } };
+  const saveMerge = v => { try { localStorage.setItem(MERGE_KEY, v ? '1' : '0'); } catch {} };
 
   /* ---------- PRODUCE ONE FILE ---------- */
   async function produce(base, def, p, cache) {
@@ -83,8 +93,12 @@
     if (f.vector) return render(base, def, 1, 'pdf');
     const s = parseScale(p.scale, def.w, def.h);
     const [tw, th] = sizeOf(def, p);
-    const key = def.src + '|' + s + '|' + (def.rev ?? '');
-    const png = await (cache[key] ||= render(base, def, s, 'png'));
+    // whole-pixel size: Chrome encodes the final file itself, no round trip through a canvas
+    if (Number.isInteger(def.w * s) && Number.isInteger(def.h * s)) {
+      if (p.format !== 'png') return render(base, def, s, p.format, p.quality);
+      return cache[def.src + '|' + s] ||= render(base, def, s, 'png');
+    }
+    const png = await (cache[def.src + '|' + s] ||= render(base, def, s, 'png'));
     const bmp = await createImageBitmap(png);
     if (p.format === 'png' && bmp.width === tw && bmp.height === th) return png;
     const c = document.createElement('canvas');
@@ -134,6 +148,17 @@
     return new Blob([...local, ...central, e], { type: 'application/zip' });
   }
 
+  // keep a copy in projects/<id>/exports/<dir>/ so no export is ever lost
+  async function store(base, dir, f) {
+    const q = new URLSearchParams({ base, dir, name: f.name });
+    const r = await fetch('__atelier/save?' + q, { method: 'POST', body: f.blob });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
+  }
+  const stamp = (d = new Date()) => {
+    const z = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())} ${z(d.getHours())}.${z(d.getMinutes())}.${z(d.getSeconds())}`;
+  };
+
   function download(blob, name) {
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
@@ -156,7 +181,7 @@
     const all = groups.flatMap((g, gi) => g.items.map((def, ii) => ({ key: gi + ':' + ii, gi, def })));
     const on = new Set(all.filter(x => want.has(x.def.id)).map(x => x.key));
     if (!on.size) all.forEach(x => on.add(x.key)); // nothing selected: start from every board
-    let running = false, cancelled = false;
+    let running = false, cancelled = false, merge = loadMerge();
 
     const dlg = document.createElement('dialog');
     dlg.className = 'xp';
@@ -180,6 +205,7 @@
           <div class="xp-sub"><span>${esc(t('export.settings'))}</span>
             <button class="xp-icon" data-add title="${esc(t('export.add'))}">${ICON_PLUS}</button></div>
           <div class="xp-rows"></div>
+          <label class="xp-merge"><input type="checkbox" data-merge><span>${esc(t('export.mergePdf'))}</span></label>
           <datalist id="xp-scales">${SCALES.map(s => `<option value="${s}">`).join('')}</datalist>
         </section>
       </div>
@@ -192,6 +218,12 @@
     const rows = $('.xp-rows'), runBtn = $('[data-run]'), statusEl = $('.xp-status');
     const setStatus = (msg, kind = '') => { statusEl.textContent = msg; statusEl.className = 'xp-status ' + kind; };
     const picked = () => all.filter(x => on.has(x.key));
+    // one job per file: a board × setting, or every board in one PDF when merging
+    const jobs = () => {
+      const defs = picked().map(x => x.def), single = merge && defs.length > 1;
+      return presets.flatMap(p => single && FORMATS[p.format].vector
+        ? [{ defs, p }] : defs.map(def => ({ def, p })));
+    };
 
     function sync() {
       $$('[data-key]').forEach(cb => { cb.checked = on.has(cb.dataset.key); });
@@ -200,7 +232,11 @@
         cb.checked = n > 0 && n === mine.length;
         cb.indeterminate = n > 0 && n < mine.length;
       });
-      const n = picked().length * presets.length;
+      const n = jobs().length;
+      const mergeEl = $('.xp-merge');
+      mergeEl.hidden = !presets.some(p => FORMATS[p.format].vector);
+      mergeEl.classList.toggle('off', picked().length < 2);
+      $('[data-merge]').checked = merge;
       $('.xp-count').textContent = t('export.selected', { n: picked().length });
       runBtn.textContent = t(n === 1 ? 'export.runOne' : 'export.run', { n });
       runBtn.disabled = running || !n || status !== 'ok';
@@ -255,6 +291,7 @@
       if (cb.dataset.sec) all.filter(x => x.gi === +cb.dataset.sec).forEach(x => cb.checked ? on.add(x.key) : on.delete(x.key));
       sync();
     });
+    $('[data-merge]').onchange = e => { merge = e.target.checked; saveMerge(merge); sync(); };
     $('[data-all]').onclick = () => { all.forEach(x => on.add(x.key)); sync(); };
     $('[data-none]').onclick = () => { on.clear(); sync(); };
 
@@ -274,25 +311,41 @@
     dlg.addEventListener('cancel', e => e.preventDefault()); // Escape goes through onKey
 
     runBtn.onclick = async () => {
-      const jobs = picked().flatMap(x => presets.map(p => ({ def: x.def, p })));
-      if (jobs.some(j => !FORMATS[j.p.format].vector && !sizeOf(j.def, j.p))) return setStatus(t('export.badScale'), 'err');
+      const list = jobs();
+      if (list.some(j => j.def && !FORMATS[j.p.format].vector && !sizeOf(j.def, j.p))) return setStatus(t('export.badScale'), 'err');
       running = true; cancelled = false; sync();
-      const files = [], used = new Map(), cache = {};
-      try {
-        for (const [i, j] of jobs.entries()) {
-          if (cancelled) return setStatus(t('export.cancelled'));
-          setStatus(t('export.progress', { i: i + 1, n: jobs.length }));
-          const blob = await produce(base, j.def, j.p, cache);
-          let name = fileName(j.def, j.p);
-          const n = (used.get(name) || 0) + 1; used.set(name, n);
-          if (n > 1) name = name.replace(/(\.\w+)$/, ` (${n})$1`);
-          files.push({ name, blob });
+      const files = [], cache = {};
+      let next = 0, done = 0;
+      setStatus(t('export.progress', { i: 0, n: list.length }));
+      // a few workers pull jobs in order; each file keeps its job's slot so the order is stable
+      const worker = async () => {
+        while (next < list.length && !cancelled) {
+          const i = next++, j = list[i];
+          const blob = j.defs ? await render(base, j.defs, 1, 'pdf') : await produce(base, j.def, j.p, cache);
+          const name = j.defs ? safe(projectName) + (j.p.suffix || '') + '.pdf' : fileName(j.def, j.p);
+          files[i] = { name, blob };
+          if (!cancelled) setStatus(t('export.progress', { i: ++done, n: list.length }));
         }
+      };
+      try {
+        await Promise.all(Array.from({ length: Math.min(PARALLEL, list.length) }, worker));
         if (cancelled) return setStatus(t('export.cancelled'));
+        const used = new Map();
+        for (const f of files) {
+          const n = (used.get(f.name) || 0) + 1; used.set(f.name, n);
+          if (n > 1) f.name = f.name.replace(/(\.\w+)$/, ` (${n})$1`);
+        }
+        const dir = stamp();
+        const saved = Promise.all(files.map(f => store(base, dir, f))).then(() => null, err => err);
         if (files.length === 1) download(files[0].blob, files[0].name);
         else { setStatus(t('export.zipping')); download(await zip(files), safe(projectName) + '.zip'); }
-        setStatus(t(files.length === 1 ? 'export.doneOne' : 'export.done', { n: files.length }), 'ok');
+        const done = t(files.length === 1 ? 'export.doneOne' : 'export.done', { n: files.length });
+        const err = await saved;
+        if (err) setStatus(done + ' · ' + t('export.saveFailed', { msg: err.message }), 'err');
+        else setStatus(done + ' · ' + t('export.savedIn', { path: base + 'exports/' + dir }), 'ok');
+        statusEl.title = statusEl.textContent;
       } catch (err) {
+        cancelled = true; // stop the other workers
         setStatus(t('export.failed', { msg: err.message }), 'err');
       } finally {
         running = false;

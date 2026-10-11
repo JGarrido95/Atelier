@@ -249,6 +249,10 @@ body.space .viewport { cursor: grab; }
 .xp-q { margin-left: auto; display: flex; align-items: center; gap: 8px; }
 .xp-q input { width: 110px; accent-color: var(--ui-accent); }
 .xp-q b { width: 24px; text-align: right; color: var(--ui-text); font-weight: 500; font-variant-numeric: tabular-nums; }
+.xp-merge { display: flex; align-items: center; gap: 8px; margin: 14px 12px 0 18px; padding-top: 12px; border-top: 1px solid var(--ui-line); cursor: pointer; }
+.xp-merge[hidden] { display: none; }
+.xp-merge.off { color: var(--ui-muted); }
+.xp-merge input { accent-color: var(--ui-accent); width: 14px; height: 14px; flex: none; margin: 0; }
 .xp-foot { display: flex; align-items: center; gap: 8px; padding: 12px 18px; border-top: 1px solid var(--ui-line); }
 .xp-status { flex: 1; color: var(--ui-muted); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .xp-status.ok { color: var(--st-approved); }

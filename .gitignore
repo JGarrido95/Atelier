@@ -6,3 +6,7 @@ projects/*
 !projects/example/
 # Python bytecode
 __pycache__/
+# Rendered reels/videos stay local
+reels/
+# Exports kept by atelier.py stay local
+projects/*/exports/

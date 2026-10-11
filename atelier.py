@@ -3,6 +3,8 @@
 
 Serves the Atelier folder on http://localhost and renders exports with
 headless Chrome, so PNG/JPG/WEBP/PDF files match the browser pixel for pixel.
+One Chrome is started on demand and kept running (driven through the DevTools
+protocol), so each board renders in a fresh tab in well under a second.
 Atelier.html keeps working from file:// without it; only export (and
 "copy image" in the viewer) needs the server.
 
@@ -13,13 +15,21 @@ Atelier.html keeps working from file:// without it; only export (and
 Chrome is auto-detected; set ATELIER_CHROME=/path/to/chrome to override.
 
 Endpoints (used by app/export.js):
-    GET /__atelier/ping                         → {"export": bool}
-    GET /__atelier/render?src=&type=&w=&h=&scale=&format=png|pdf
+    GET /__atelier/ping                         → {"export": bool}, warms Chrome up
+    GET /__atelier/render?src=&type=&w=&h=&scale=&format=png|jpg|webp|pdf&quality=
+        src/type/w/h repeated → one PDF with a page per board
+    GET /__atelier/sheet?src=&type=&w=&h=[&pdf=1] → page wrapping images / several boards
+    POST /__atelier/save?base=projects/<id>/&dir=&name=  (body = file) → {"path"}
+        keeps a copy of every export in projects/<id>/exports/<dir>/
 """
 import argparse
+import base64
 import json
 import os
+import re
 import shutil
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -28,8 +38,8 @@ import time
 import webbrowser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
-from urllib.request import urlopen
+from urllib.parse import parse_qs, quote, urlencode, urlparse
+from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
 PROJECTS = ROOT / "projects"
@@ -59,67 +69,215 @@ def find_chrome():
 
 
 CHROME = find_chrome()
-render_lock = threading.Lock()  # one headless Chrome at a time keeps the machine responsive
+PORT = 4747  # set in main(); the renderer loads boards from this server
+PROFILE = Path(tempfile.gettempdir()) / "atelier-chrome"  # its cache keeps web fonts across restarts
 
 
-def run_chrome(cmd, out, timeout=90):
-    """Run Chrome until `out` is written. Headless Chrome sometimes lingers
-    after writing the file, so stop it once the output stops growing."""
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    deadline, last = time.monotonic() + timeout, -1
-    try:
-        while proc.poll() is None and time.monotonic() < deadline:
-            time.sleep(0.15)
-            size = out.stat().st_size if out.exists() else -1
-            if size > 0 and size == last:
-                break
-            last = size
-    finally:
-        if proc.poll() is None:
-            proc.terminate()
+class WebSocket:
+    """Minimal blocking WebSocket client (RFC 6455), enough to talk to Chrome DevTools."""
+
+    def __init__(self, url, timeout=60):
+        u = urlparse(url)
+        self.sock = socket.create_connection((u.hostname, u.port), timeout=timeout)
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall((f"GET {u.path} HTTP/1.1\r\nHost: {u.hostname}:{u.port}\r\n"
+                           "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                           f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        self.buf = b""
+        while b"\r\n\r\n" not in self.buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("DevTools handshake failed")
+            self.buf += chunk
+        head, self.buf = self.buf.split(b"\r\n\r\n", 1)
+        if b" 101 " not in head.split(b"\r\n", 1)[0]:
+            raise ConnectionError("DevTools refused the connection")
+
+    def _read(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(max(65536, n - len(self.buf)))
+            if not chunk:
+                raise ConnectionError("DevTools connection closed")
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def send(self, text):
+        data, mask = text.encode(), os.urandom(4)
+        n = len(data)
+        head = bytes([0x81]) + (bytes([0x80 | n]) if n < 126 else
+                                struct.pack("!BH", 0x80 | 126, n) if n < 65536 else
+                                struct.pack("!BQ", 0x80 | 127, n))
+        self.sock.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def recv(self):
+        msg = b""
+        while True:
+            b0, b1 = self._read(2)
+            n = b1 & 0x7F
+            if n == 126:
+                n = struct.unpack("!H", self._read(2))[0]
+            elif n == 127:
+                n = struct.unpack("!Q", self._read(8))[0]
+            data = self._read(n)  # server frames are never masked
+            op = b0 & 0x0F
+            if op == 8:
+                raise ConnectionError("DevTools connection closed")
+            if op in (0, 1, 2):
+                msg += data
+                if b0 & 0x80:
+                    return msg.decode()
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+class Browser:
+    """One headless Chrome kept alive for the whole session, driven through the
+    DevTools protocol. Launching Chrome costs seconds; a new tab costs ~50 ms,
+    and several tabs render in parallel."""
+
+    def __init__(self):
+        self.proc, self.endpoint, self.lock = None, None, threading.Lock()
+        self.slots = threading.Semaphore(max(2, min(6, (os.cpu_count() or 4) // 2)))
+
+    def start(self):
+        with self.lock:
+            if self.proc and self.proc.poll() is None:
+                return self.endpoint
             try:
-                proc.wait(5)
+                self.endpoint = self._launch(PROFILE)
+            except RuntimeError:  # profile busy (another Atelier server): use a throwaway one
+                self.endpoint = self._launch(tempfile.mkdtemp(prefix="atelier-chrome-"))
+            return self.endpoint
+
+    def _launch(self, profile):
+        """Start Chrome on `profile` and return its DevTools host:port."""
+        proc = self.proc = subprocess.Popen(
+            [CHROME, "--headless=new", "--hide-scrollbars", "--no-first-run",
+             "--no-default-browser-check", "--disable-extensions", "--mute-audio",
+             "--remote-debugging-port=0", f"--user-data-dir={profile}", "about:blank"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, errors="replace")
+        found = []
+
+        def read_stderr():  # also drains stderr so Chrome never blocks on it
+            for line in proc.stderr:
+                m = re.search(r"DevTools listening on ws://([^/\s]+)/", line)
+                if m and not found:
+                    found.append(m.group(1))
+        threading.Thread(target=read_stderr, daemon=True).start()
+        deadline = time.monotonic() + 20
+        while not found and proc.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if not found:
+            self.stop()
+            raise RuntimeError("Chrome did not start")
+        return found[0]
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(5)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                self.proc.kill()
+        self.proc = None
+
+    def warm(self):
+        threading.Thread(target=lambda: self._try(self.start), daemon=True).start()
+
+    @staticmethod
+    def _try(fn):
+        try:
+            fn()
+        except Exception:  # noqa: BLE001 — warm-up is best effort
+            pass
+
+    def render(self, url, w, h, scale, fmt, quality=90, timeout=60):
+        with self.slots:
+            try:
+                return self._render(self.start(), url, w, h, scale, fmt, quality, timeout)
+            except (OSError, ConnectionError):
+                self.stop()  # Chrome crashed or hung: restart once
+                return self._render(self.start(), url, w, h, scale, fmt, quality, timeout)
+
+    def _render(self, endpoint, url, w, h, scale, fmt, quality, timeout):
+        req = Request(f"http://{endpoint}/json/new?about:blank", method="PUT")
+        with urlopen(req, timeout=10) as r:
+            target = json.loads(r.read())
+        ws = WebSocket(target["webSocketDebuggerUrl"], timeout)
+        ids = iter(range(1, 1 << 30))
+
+        def call(method, wait_event=None, **params):
+            """Send a command; with wait_event, also wait for that event (before or after the reply)."""
+            i, result, seen = next(ids), None, not wait_event
+            ws.send(json.dumps({"id": i, "method": method, "params": params}))
+            while result is None or not seen:
+                m = json.loads(ws.recv())
+                if m.get("id") == i:
+                    if "error" in m:
+                        raise RuntimeError(f"{method}: {m['error'].get('message')}")
+                    result = m.get("result", {})
+                elif m.get("method") == wait_event:
+                    seen = True
+            return result
+
+        try:
+            call("Page.enable")
+            call("Emulation.setDeviceMetricsOverride", width=w, height=h,
+                 deviceScaleFactor=scale if fmt != "pdf" else 1, mobile=False)
+            call("Page.navigate", "Page.loadEventFired", url=url)
+            # wait for web fonts and images (iframes included), finish CSS animations, let it paint
+            call("Runtime.evaluate", awaitPromise=True, expression=SETTLE_JS)
+            if fmt == "pdf":
+                res = call("Page.printToPDF", printBackground=True, preferCSSPageSize=True,
+                           marginTop=0, marginBottom=0, marginLeft=0, marginRight=0,
+                           displayHeaderFooter=False, transferMode="ReturnAsBase64")
+            else:
+                shot = {"format": "jpeg" if fmt == "jpg" else fmt}
+                if fmt != "png":
+                    shot["quality"] = quality
+                res = call("Page.captureScreenshot", **shot)
+            return base64.b64decode(res["data"])
+        finally:
+            ws.close()
+            try:
+                urlopen(f"http://{endpoint}/json/close/{target['id']}", timeout=5).close()
+            except OSError:
+                pass
 
 
-def render(src, kind, w, h, scale, fmt):
-    """Render one board with headless Chrome and return the file bytes."""
-    with tempfile.TemporaryDirectory(prefix="atelier-") as tmp:
-        tmp = Path(tmp)
-        if kind == "image":
-            # wrap the image in a page the size of the item (same object-fit as the canvas)
-            page = tmp / "image.html"
-            page.write_text(
-                "<!doctype html><meta charset=utf-8><style>"
-                f"@page{{size:{w}px {h}px;margin:0}}"
-                f"html,body{{margin:0;width:{w}px;height:{h}px;overflow:hidden}}"
-                "img{display:block;width:100%;height:100%;object-fit:cover}"
-                f"</style><img src=\"{src.as_uri()}\">",
-                encoding="utf-8",
-            )
-            url = page.as_uri()
-        else:
-            url = src.as_uri()
+SETTLE_JS = """(async () => {
+  const docs = [document];
+  for (const f of document.querySelectorAll('iframe')) try { f.contentDocument && docs.push(f.contentDocument); } catch {}
+  await Promise.all(docs.map(d => d.fonts && d.fonts.ready));
+  await Promise.all(docs.flatMap(d => [...d.images].map(i => i.decode().catch(() => {}))));
+  for (const d of docs) for (const a of d.getAnimations?.() || []) try { a.finish(); } catch {}
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+})()"""
 
-        out = tmp / ("out.pdf" if fmt == "pdf" else "out.png")
-        cmd = [
-            CHROME, "--headless=new", "--hide-scrollbars", "--no-first-run",
-            "--no-default-browser-check", "--disable-extensions",
-            "--virtual-time-budget=5000",
-            "--allow-file-access-from-files",
-        ]
-        if fmt == "pdf":
-            cmd += ["--no-pdf-header-footer", f"--print-to-pdf={out}"]
-        else:
-            cmd += [f"--window-size={w},{h}", f"--force-device-scale-factor={scale}",
-                    f"--screenshot={out}"]
-        cmd.append(url)
-        with render_lock:
-            run_chrome(cmd, out)
-        if not out.exists():
-            raise RuntimeError("Chrome produced no output")
-        return out.read_bytes()
+BROWSER = Browser()
+
+
+def sheet_html(items, pdf):
+    """Page wrapping one or more items: images get the canvas' object-fit, several
+    boards become one PDF with one page per board, each at its own size."""
+    css = ["html,body{margin:0;background:transparent}",
+           "iframe,img{display:block;border:0;break-after:page}",
+           "img{object-fit:cover}"]
+    body = []
+    for n, (src, kind, w, h) in enumerate(items):
+        css.append(f"@page p{n}{{size:{w}px {h}px;margin:0}}")
+        style = f"width:{w}px;height:{h}px;page:p{n}"
+        url = "/" + quote(src)
+        body.append(f'<img src="{url}" style="{style}">' if kind == "image" else
+                    f'<iframe src="{url}" style="{style}" scrolling="no"></iframe>')
+    if len(items) == 1 and not pdf:
+        css.append("html,body{overflow:hidden}")
+    return ("<!doctype html><meta charset=utf-8><style>" + "".join(css) + "</style>" + "".join(body))
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -148,34 +306,110 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         url = urlparse(self.path)
         if url.path == "/__atelier/ping":
+            if CHROME:
+                BROWSER.warm()  # the export dialog is opening: start Chrome now
             return self.send_bytes(200, json.dumps({"export": bool(CHROME)}).encode(), "application/json")
         if url.path == "/__atelier/render":
             return self.handle_render(parse_qs(url.query))
+        if url.path == "/__atelier/sheet":
+            q = parse_qs(url.query)
+            try:
+                items = self.items(q)
+            except LookupError as e:
+                return self.fail(404, str(e))
+            except ValueError:
+                return self.fail(400, "bad parameters")
+            return self.send_bytes(200, sheet_html(items, q.get("pdf") == ["1"]).encode(), "text/html; charset=utf-8")
         return super().do_GET()
+
+    def do_POST(self):
+        url = urlparse(self.path)
+        if url.path != "/__atelier/save":
+            return self.fail(404, "not found")
+        q = parse_qs(url.query)
+        arg = lambda k: q.get(k, [""])[0]
+        clean = lambda v: re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "-", v).strip(" .")
+        project = (ROOT / arg("base")).resolve()
+        folder, name = clean(arg("dir")), clean(arg("name"))
+        if project.parent != PROJECTS or not project.is_dir():
+            return self.fail(404, "project not found")
+        if not folder or not name:
+            return self.fail(400, "bad parameters")
+        try:
+            size = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            return self.fail(411, "length required")
+        out = project / "exports" / folder / name
+        out.parent.mkdir(parents=True, exist_ok=True)
+        stem, ext, n = out.stem, out.suffix, 1
+        while out.exists():  # never overwrite an earlier export
+            n += 1
+            out = out.with_name(f"{stem} ({n}){ext}")
+        with open(out, "wb") as f:
+            left = size
+            while left > 0:
+                chunk = self.rfile.read(min(left, 1 << 20))
+                if not chunk:
+                    break
+                f.write(chunk)
+                left -= len(chunk)
+        if left > 0:
+            out.unlink(missing_ok=True)
+            return self.fail(400, "upload interrupted")
+        self.send_bytes(200, json.dumps({"path": out.relative_to(ROOT).as_posix()}).encode(), "application/json")
+
+    @staticmethod
+    def items(q):
+        """[(src, type, w, h)] from repeated src/type/w/h parameters; src stays inside projects/."""
+        srcs, n = q.get("src", []), len(q.get("src", []))
+        kinds = q.get("type", ["html"] * n)
+        ws, hs = q.get("w", []), q.get("h", [])
+        if not n or not (len(kinds) == len(ws) == len(hs) == n):
+            raise ValueError
+        out = []
+        for src, kind, w, h in zip(srcs, kinds, ws, hs):
+            path = (ROOT / src).resolve()
+            if PROJECTS not in path.parents or not path.is_file():
+                raise LookupError("board not found")
+            w, h = int(w), int(h)
+            if not (0 < w <= MAX_SIDE and 0 < h <= MAX_SIDE) or kind not in ("html", "image"):
+                raise ValueError
+            out.append((path.relative_to(ROOT).as_posix(), kind, w, h))
+        return out
 
     def handle_render(self, q):
         if not CHROME:
             return self.fail(501, "Chrome not found (set ATELIER_CHROME)")
         arg = lambda k, d=None: q.get(k, [d])[0]
         try:
-            src = (ROOT / arg("src", "")).resolve()
-            w, h = int(arg("w")), int(arg("h"))
+            items = self.items(q)
             scale = float(arg("scale", "1"))
+            quality = int(arg("quality", "90"))
             fmt = arg("format", "png")
-            kind = arg("type", "html")
+        except LookupError as e:
+            return self.fail(404, str(e))
         except (TypeError, ValueError):
             return self.fail(400, "bad parameters")
-        if PROJECTS not in src.parents or not src.is_file():
-            return self.fail(404, "board not found")
-        if fmt not in ("png", "pdf") or not (0 < w and 0 < h and 0 < scale <= 16):
+        if fmt not in ("png", "jpg", "webp", "pdf") or not (0 < scale <= 16 and 1 <= quality <= 100):
             return self.fail(400, "bad parameters")
-        if fmt == "png" and max(w, h) * scale > MAX_SIDE:
+        if len(items) > 1 and fmt != "pdf":
+            return self.fail(400, "several boards only make one PDF")
+        src, kind, w, h = items[0]
+        if fmt != "pdf" and max(w, h) * scale > MAX_SIDE:
             return self.fail(400, f"image too large (max {MAX_SIDE}px per side)")
+        base = f"http://127.0.0.1:{PORT}/"
+        if len(items) == 1 and kind == "html":
+            url = base + quote(src)
+        else:
+            sheet = [("src", i[0]) for i in items] + [("type", i[1]) for i in items] + \
+                    [("w", i[2]) for i in items] + [("h", i[3]) for i in items]
+            url = base + "__atelier/sheet?" + urlencode(sheet + [("pdf", int(fmt == "pdf"))])
         try:
-            body = render(src, kind, w, h, scale, fmt)
+            body = BROWSER.render(url, w, h, scale, fmt, quality)
         except Exception as e:  # noqa: BLE001 — report any Chrome failure to the UI
             return self.fail(500, str(e))
-        self.send_bytes(200, body, "application/pdf" if fmt == "pdf" else "image/png")
+        mime = {"pdf": "application/pdf", "jpg": "image/jpeg", "webp": "image/webp"}.get(fmt, "image/png")
+        self.send_bytes(200, body, mime)
 
 
 def is_running(port):
@@ -289,7 +523,10 @@ def main():
             webbrowser.open(url)
         return
 
+    global PORT
+    PORT = args.port
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    server.daemon_threads = True
     print(f"Atelier → {url}")
     print("Export: " + (CHROME or "unavailable — Chrome not found, set ATELIER_CHROME"))
     print("Ctrl+C to stop")
@@ -299,6 +536,8 @@ def main():
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        BROWSER.stop()
 
 
 if __name__ == "__main__":

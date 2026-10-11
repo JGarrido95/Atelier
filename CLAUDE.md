@@ -30,6 +30,7 @@ projects/<id>/manifest.js → SINGLE source of truth for what appears on that pr
 projects/<id>/assets/     → project css/logo/fonts
 projects/<id>/boards/     → one board = one standalone HTML file
 projects/<id>/sources/    → the user's original files (pdf, png…): do not modify
+projects/<id>/exports/    → a copy of every export, one folder per run (`YYYY-MM-DD HH.MM.SS`), saved by atelier.py: do not modify
 projects/<id>/CLAUDE.md   → project-specific rules (brand, tone)
 projects/example/         → demo project, the only versioned one
 ```
@@ -77,7 +78,7 @@ Sections stack vertically in order; boards sit side by side left to right. Use `
 
 ## Export
 
-Export (⇧⌘E on the canvas and in the viewer) needs `python3 atelier.py`: the page must be served over http so it can call `/__atelier/render`, which runs headless Chrome (`--screenshot` with `--force-device-scale-factor` for PNG, `--print-to-pdf` for PDF). JPG/WEBP are re-encoded in the browser; multiple files are zipped in the browser. Opened from `file://`, the dialog explains how to start the server; the viewer's print / save as PDF works without it.
+Export (⇧⌘E on the canvas and in the viewer) needs `python3 atelier.py`: the page must be served over http so it can call `/__atelier/render`. The server starts one headless Chrome on demand (warmed up when the export dialog opens), keeps it running and drives it through the DevTools protocol: each board renders in a new tab, several in parallel, from `http://127.0.0.1:<port>/…`. Its profile lives in the system temp dir (`atelier-chrome`) so Google Fonts stay cached across restarts. PNG/JPG/WEBP come straight from Chrome when the scaled size is whole pixels, otherwise the PNG is resampled in the browser. The "single PDF" checkbox merges the selected boards into one PDF (repeated `src/type/w/h` params → a wrapper page with one named `@page` per board). Multiple files are zipped in the browser. Every export is also saved, file by file, in `projects/<id>/exports/<date time>/` (`POST /__atelier/save`, never overwrites; ignored by git). Opened from `file://`, the dialog explains how to start the server; the viewer's print / save as PDF works without it.
 
 ## Verification
 
